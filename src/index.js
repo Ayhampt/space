@@ -1,13 +1,19 @@
 import dotenv from "dotenv";
-import express from "express";
+import app from "./app.js";
+import connectDb from "./db/db.js";
 
 dotenv.config({
   path: "./.env",
 });
-
-const app = express();
 const port = process.env.PORT || 3000;
 
-app.listen(port, () => {
-  console.log(`Space backend is running on http://localhost:${port}`);
-});
+connectDb()
+  .then(() => {
+    app.listen(port, () => {
+      console.log(`🔗 Space backend is running on http://localhost:${port}`);
+    });
+  })
+  .catch((err) => {
+    console.error("❌ Mongodb Error", err);
+    process.exit(1);
+  });
