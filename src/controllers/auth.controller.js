@@ -3,6 +3,7 @@ import { ApiResponse } from "../utils/api-response.js";
 import { ApiError } from "../utils/api-error.js";
 import { asyncHandler } from "../utils/async-handler.js";
 import { emailVerificationMailgenContent, sendMail } from "../utils/mail.js";
+import jwt from "jsonwebtoken";
 
 const generateAccessAndRefreshTokens = async (userId) => {
   try {
@@ -23,7 +24,7 @@ const generateAccessAndRefreshTokens = async (userId) => {
 };
 
 const registerUser = asyncHandler(async (req, res) => {
-  const { email, username, password, role } = req.body;
+  const { email, username, password} = req.body;
 
   const existedUser = await User.findOne({
     $or: [{ username }, { email }],
@@ -114,7 +115,7 @@ const login = asyncHandler(async (req, res) => {
 const logout = asyncHandler(async (req, res) => {
   const userId = req.user?._id;
 
-   await User.findByIdAndUpdate(
+  await User.findByIdAndUpdate(
     userId,
     {
       $set: { refreshToken: null },
@@ -133,4 +134,206 @@ const logout = asyncHandler(async (req, res) => {
     .clearCookie("refreshToken", options)
     .json(new ApiResponse(200, {}, "User logged out successfully"));
 });
-export { registerUser, login, logout };
+
+const getCurrentUser = asyncHandler(async (req, res) => {
+  const user = req.user?._id;
+  return res
+    .status(200)
+    .json(new ApiResponse(200, user, "Current user feched successfully"));
+});
+
+const verifyEmail = asyncHandler(async (req, res) => {
+  const { verificationToken } = req.params;
+  if (!verificationToken) {
+    throw new ApiError(400, "email verification token is missing");
+  }
+  let hashedToken = crypto
+    .createHash("sha256")
+    .update(verificationToken)
+    .digest("hex");
+
+  const user = await User.findOne({
+    emailVerificationToken: hashedToken,
+    emailVerificationExpiry: { $gt: Date.now() },
+  });
+  if (!user) {
+    throw new ApiError(400, "Token is Invalid or Expired");
+  }
+  user.emailVerificationExpiry = undefined;
+  user.emailVerificationToken = undefined;
+  user.isEmailVerified = true;
+  await user.save({ validateBeforeSave: false });
+
+  return res.status(200).json(
+    new ApiResponse(
+      200,
+      {
+        isEmailVerified: true,
+      },
+      "Email is Verified",
+    ),
+  );
+});
+const resendEmailVerification = asyncHandler(async (req, res) => {
+  const userId = req.user?._id;
+  const user = await User.findById(userId);
+  if (!user) {
+    throw new ApiError("User does not exist");
+  }
+  if (user.isEmailVerified) {
+    throw new ApiError(404, "User email already Verified");
+  }
+  const { unHashedToken, hashedToken, tokenExpiry } =
+    user.generateTemporaryToken();
+
+  user.emailVerificationToken = hashedToken;
+  user.emailVerificationExpiry = tokenExpiry;
+
+  user.save({ validateBeforeSave: false });
+
+  await sendMail({
+    email: user?.email,
+    subject: "please verify your email",
+    mailgenContent: emailVerificationMailgenContent(
+      user.username,
+      `${req.protocol}://${req.get("host")}/api/v1/users/verify-email/${unHashedToken}`,
+    ),
+  });
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, {}, "Email send to your inbox successfully"));
+});
+const refreshAccessToken = asyncHandler(async (req, res) => {
+  const incomingRefreshToken = req.cookie.refreshToken || req.body.refreshToken;
+  if (!incomingRefreshToken) {
+    new ApiError(401, "Unauthorized access");
+  }
+  try {
+    const decodedoken = jwt.verify(
+      incomingRefreshToken,
+      process.env.REFRESH_TOKEN_SECRET,
+    );
+
+    const userId = decodedoken?._id;
+
+    const user = await User.findById(userId);
+    if (!user) {
+      new ApiError(401, "Invalid refreshToken");
+    }
+    if (incomingRefreshToken != user?.refreshToken) {
+      new ApiError(401, "Refresh token is Expired");
+    }
+    const options = {
+      httpOnly: true,
+      secure: true,
+    };
+    const { accessToken, refreshToken: newRefreshToken } =
+      await generateAccessAndRefreshTokens(user._id);
+    user.refreshToken = newRefreshToken;
+    await user.save();
+
+    return res
+      .status(200)
+      .cookie("accessToken", accessToken, options)
+      .cookie("refreshToken", newRefreshToken, options)
+      .json(
+        new ApiResponse(
+          200,
+          { accessToken, refreshToken: newRefreshToken },
+          "Access token refreshed",
+        ),
+      );
+  } catch (error) {
+    new ApiError(401, "Refresh token is Expired");
+  }
+});
+const changeCurrentPassword = asyncHandler(async (req, res) => {
+  const { oldPassword, newPassword } = req.body;
+
+  const user = await User.findById(req.user?._id);
+
+  const isPasswordValid = await user.isPasswordCorrect(oldPassword);
+
+  if (!isPasswordValid) {
+    throw new ApiError(400, "Invalid old password");
+  }
+  user.password = newPassword;
+  await user.save({ validateBeforeSave: false });
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, {}, "password changed successfully"));
+});
+
+const forgotPasswordRequest = asyncHandler(async (req, res) => {
+  const { email } = req.body;
+
+  const user = await User.findOne(email);
+  if (!user) {
+    throw new ApiError(404, "user does not exist", []);
+  }
+  const { unHashedToken, hashedToken, tokenExpiry } =
+    user.generateTemporaryToken();
+
+  user.forgotPasswordToken = hashedToken;
+  user.forgotPasswordExpiry = tokenExpiry;
+
+  await user.save({ validateBeforeSave: false });
+
+  await sendMail({
+    email: user?.email,
+    subject: "Password reset request",
+    mailgenContent: forgotPasswordMailgenContent(
+      user.username,
+      `${process.env.FORGOT_PASSWORD_REDIRECT_URL}/${unHashedToken}`,
+    ),
+  });
+  return res
+    .status(200)
+    .json(
+      new ApiResponse(
+        200,
+        {},
+        "Password reset mail has been sent on your mail id",
+      ),
+    );
+});
+const resetForgotPassword = asyncHandler(async (req, res) => {
+  const { resetToken } = req.params;
+  const { newPassword } = req.body;
+
+  let hashedToken = crypto
+    .createHash("sha256")
+    .update(resetToken)
+    .digest("hex");
+
+  const user = await User.findOne({
+    forgotPasswordToken: hashedToken,
+    forgotPasswordExpiry: { $gt: Date.now() },
+  });
+  if (!user) {
+    throw new ApiError(489, "Token is Invalid or expired");
+  }
+  user.forgotPasswordExpiry = undefined;
+  user.forgotPasswordToken = undefined;
+
+  user.password = newPassword;
+  await user.save({ validateBeforeSave: false });
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, {}, "Password reset successfullys"));
+});
+export {
+  registerUser,
+  login,
+  logout,
+  getCurrentUser,
+  verifyEmail,
+  resendEmailVerification,
+  refreshAccessToken,
+  changeCurrentPassword,
+  forgotPasswordRequest,
+  resetForgotPassword,
+};
